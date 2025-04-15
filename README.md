@@ -114,8 +114,7 @@ MIT License. Feel free to modify and share.
 
 ---
 
-## 👤 Author
+## 👨‍💻 Author
+Built by [@alwalid54321](https://t.me/alwalid54321)
 
-Developed by [@alwalid54321](https://t.me/alwalid54321)
-
-```
+Feel free to contribute, fork, or give feedback!

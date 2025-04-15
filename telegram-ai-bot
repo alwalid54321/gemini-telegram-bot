@@ -1,0 +1,383 @@
+import os
+import logging
+import asyncio
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import google.generativeai as genai
+from google.generativeai import types  # Import types for configuration
+from PIL import Image
+from io import BytesIO
+import base64
+import re
+import requests
+import html
+import time
+import nest_asyncio
+import json
+from functools import wraps
+
+# Allow nested event loops
+nest_asyncio.apply()
+
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    filename='telegram_bot.log'
+)
+logger = logging.getLogger(__name__)
+
+# Get API keys from environment variables
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+ADMIN_USER_ID = int(os.environ.get('ADMIN_USER_ID', '0'))
+
+# Configure Gemini API and models
+genai.configure(api_key=GEMINI_API_KEY)
+text_model = genai.GenerativeModel('gemini-1.5-pro')
+image_model = genai.GenerativeModel('gemini-2.0-flash-exp-image-generation')
+
+# Rate limiting settings
+last_api_call = 0
+MIN_TIME_BETWEEN_CALLS = 2  # seconds between API calls
+
+# File to store authorized users
+AUTH_FILE = 'authorized_users.json'
+
+# Load authorized users from file
+def load_authorized_users():
+    try:
+        with open(AUTH_FILE, 'r') as f:
+            data = json.load(f)
+            return set(data.get('users', []))
+    except (FileNotFoundError, json.JSONDecodeError):
+        authorized_users = {ADMIN_USER_ID} if ADMIN_USER_ID else set()
+        save_authorized_users(authorized_users)
+        return authorized_users
+
+# Save authorized users to file
+def save_authorized_users(users):
+    with open(AUTH_FILE, 'w') as f:
+        json.dump({'users': list(users)}, f)
+
+AUTHORIZED_USERS = load_authorized_users()
+
+# Decorator for restricting access to authorized users
+def restricted(func):
+    @wraps(func)
+    async def wrapped(update, context, *args, **kwargs):
+        user_id = update.effective_user.id
+        if user_id not in AUTHORIZED_USERS:
+            await update.message.reply_text(
+                "🔒 Sorry, you're not authorized to use this bot.\n"
+                "Please contact the admin (@alwalid54321) to request access."
+            )
+            logger.warning(f"Unauthorized access attempt from user {user_id} (@{update.effective_user.username})")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
+# Decorator for admin-only commands
+def admin_only(func):
+    @wraps(func)
+    async def wrapped(update, context, *args, **kwargs):
+        user_id = update.effective_user.id
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("🔒 This command is restricted to the bot admin only.")
+            logger.warning(f"Admin command attempt from non-admin user {user_id}")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
+# Sanitize text by removing HTML tags
+def sanitize_text(text):
+    return re.sub(r'<[^>]+>', '', text)
+
+# Rate limiting to avoid hitting API quotas
+def respect_rate_limit():
+    global last_api_call
+    current_time = time.time()
+    time_since_last_call = current_time - last_api_call
+    if time_since_last_call < MIN_TIME_BETWEEN_CALLS:
+        time.sleep(MIN_TIME_BETWEEN_CALLS - time_since_last_call)
+    last_api_call = time.time()
+
+# Start command handler
+@restricted
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    await update.message.reply_text(
+        f"👋 Hi {user.first_name}! I'm a bot by @alwalid54321 powered by Google's Gemini AI.\n\n"
+        f"You can:\n"
+        f"🔹 Ask me any question\n"
+        f"🔹 Generate images with /image <description>\n"
+        f"🔹 Send a voice message and I'll respond to it\n\n"
+        f"✨ Try it now!"
+    )
+
+# Help command handler
+@restricted
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📚 *How to use this bot:*\n\n"
+        "🔹 Send any text message for a standard response\n"
+        "🔹 Use /image followed by your description to generate an image\n"
+        "🔹 Send a voice message to receive a text-based response\n\n"
+        "💡 *Pro tips:*\n"
+        "• Be specific with your requests for better results\n"
+        "• For image generation, include details about style and content"
+    )
+
+# Generate image command handler
+@restricted
+async def generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate an image based on the user's prompt using Gemini."""
+    prompt = update.message.text.replace('/image', '', 1).strip()
+
+    if not prompt:
+        await update.message.reply_text("🖼️ Please provide a description after /image")
+        return
+
+    processing_message = await update.message.reply_text("🎨 Generating image... This may take a moment.")
+
+    try:
+        # Respect rate limits
+        respect_rate_limit()
+
+        # Generate image with both text and image modalities requested
+        response = image_model.generate_content(
+            prompt,
+            config=types.GenerateContentConfig(response_modalities=['Text', 'Image'])
+        )
+        
+        # Check the response structure (using candidate approach as in the sample)
+        for part in response.candidates[0].content.parts:
+            if part.inline_data is not None:
+                # Decode the image data (assuming it's base64-encoded as in your sample)
+                image_data = base64.b64decode(part.inline_data.data)
+                image = Image.open(BytesIO(image_data))
+                
+                # Save temporarily and send the image
+                img_path = "/tmp/generated_image.png"
+                image.save(img_path)
+                with open(img_path, 'rb') as img_file:
+                    await update.message.reply_photo(
+                        photo=img_file,
+                        caption=f"✨ *Generated image based on:*\n\"{prompt}\""
+                    )
+                os.remove(img_path)
+                await processing_message.delete()
+                return
+
+        # If no image was generated
+        await processing_message.edit_text(
+            "😕 Sorry, I couldn't generate an image. Please adjust your description or try again."
+        )
+
+    except Exception as e:
+        logger.error(f"Error generating image: {e}")
+        if "429" in str(e) or "quota" in str(e).lower():
+            await processing_message.edit_text("⚠️ API rate limit reached. Please try again in a few minutes.")
+        else:
+            await processing_message.edit_text("❌ Error occurred while generating the image. Please try again.")
+
+# Process text messages with Gemini-generated responses
+@restricted
+async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_message = update.message.text
+    processing_message = await update.message.reply_text("🤔 Thinking...")
+
+    try:
+        respect_rate_limit()
+
+        # Construct a prompt with instructions for Gemini
+        prompt = (
+            "You are a helpful, friendly, and professional assistant in a Telegram bot. "
+            "Provide concise, accurate, and engaging responses. Use emojis when appropriate but do not overuse them.\n\n"
+            f"User: {user_message}"
+        )
+
+        response = text_model.generate_content(prompt)
+        sanitized_response = sanitize_text(response.text)
+
+        formatted_response = f"💬 *You asked:*\n\"{user_message}\"\n\n🤖 *Response:*\n{sanitized_response}"
+        await processing_message.delete()
+
+        # Telegram message length handling
+        if len(formatted_response) > 4000:
+            first_chunk = f"💬 *You asked:*\n\"{user_message}\"\n\n🤖 *Response:*\n"
+            remaining_length = 4000 - len(first_chunk)
+            await update.message.reply_text(first_chunk + sanitized_response[:remaining_length])
+            rest_of_response = sanitized_response[remaining_length:]
+            for i in range(0, len(rest_of_response), 4000):
+                await update.message.reply_text(rest_of_response[i:i+4000])
+        else:
+            await update.message.reply_text(formatted_response)
+
+    except Exception as e:
+        logger.error(f"Error generating response: {e}")
+        if "429" in str(e) or "quota" in str(e).lower():
+            await processing_message.edit_text("⚠️ API rate limit reached. Please try again in a few minutes.")
+        else:
+            await processing_message.edit_text("❌ Error occurred while generating a response. Please try again later.")
+
+# Process voice messages by transcribing and responding via Gemini
+@restricted
+async def process_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    processing_message = await update.message.reply_text("🎤 Processing your voice message...")
+    
+    try:
+        file_id = update.message.voice.file_id
+        voice_file = await context.bot.get_file(file_id)
+        voice_path = f"/tmp/voice_{file_id}.ogg"
+        await voice_file.download_to_drive(voice_path)
+
+        await processing_message.edit_text("🎧 Listening to your message...")
+        with open(voice_path, 'rb') as f:
+            audio_bytes = f.read()
+
+        respect_rate_limit()
+
+        # Build a prompt that includes the audio data for transcription and response
+        prompt = "Please transcribe this audio and provide a helpful response to what was said."
+        response = text_model.generate_content([
+            prompt,
+            {
+                "mime_type": "audio/ogg",
+                "data": audio_bytes
+            }
+        ])
+        
+        response_text = sanitize_text(response.text)
+        parts = re.split(r'(?i)transcription:|i heard:|user said:', response_text, 1)
+
+        if len(parts) > 1:
+            transcription_part = parts[1].strip()
+            response_parts = re.split(r'(?i)response:|answer:|reply:', transcription_part, 1)
+            if len(response_parts) > 1:
+                transcription = response_parts[0].strip()
+                response_content = response_parts[1].strip()
+            else:
+                sentences = transcription_part.split('.')
+                transcription = sentences[0].strip() + "."
+                response_content = transcription_part
+        else:
+            transcription = "I processed your voice message"
+            response_content = response_text
+
+        os.remove(voice_path)
+        await processing_message.delete()
+
+        formatted_response = f"🎤 *I heard:*\n\"{transcription}\"\n\n🤖 *Response:*\n{response_content}"
+        if len(formatted_response) > 4000:
+            first_chunk = f"🎤 *I heard:*\n\"{transcription}\"\n\n🤖 *Response:*\n"
+            remaining_length = 4000 - len(first_chunk)
+            await update.message.reply_text(first_chunk + response_content[:remaining_length])
+            rest_of_response = response_content[remaining_length:]
+            for i in range(0, len(rest_of_response), 4000):
+                await update.message.reply_text(rest_of_response[i:i+4000])
+        else:
+            await update.message.reply_text(formatted_response)
+
+    except Exception as e:
+        logger.error(f"Error processing voice message: {e}")
+        if "429" in str(e) or "quota" in str(e).lower():
+            await processing_message.edit_text("⚠️ API quota exceeded. Please try again later or consider upgrading your Gemini API plan.")
+        else:
+            await processing_message.edit_text("❌ Sorry, I had trouble processing your voice message. Please try again.")
+
+# Admin-only commands for user management
+async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    @admin_only
+    async def _auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            await update.message.reply_text("Usage: /auth [user_id]")
+            return
+        try:
+            user_id = int(context.args[0])
+            AUTHORIZED_USERS.add(user_id)
+            save_authorized_users(AUTHORIZED_USERS)
+            await update.message.reply_text(f"✅ User {user_id} has been authorized.")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID. Please provide a numeric ID.")
+    return await _auth(update, context)
+
+async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    @admin_only
+    async def _revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not context.args:
+            await update.message.reply_text("Usage: /revoke [user_id]")
+            return
+        try:
+            user_id = int(context.args[0])
+            if user_id == ADMIN_USER_ID:
+                await update.message.reply_text("❌ Cannot revoke admin access.")
+                return
+            if user_id in AUTHORIZED_USERS:
+                AUTHORIZED_USERS.remove(user_id)
+                save_authorized_users(AUTHORIZED_USERS)
+                await update.message.reply_text(f"✅ User {user_id} authorization has been revoked.")
+            else:
+                await update.message.reply_text(f"ℹ️ User {user_id} is not in the authorized list.")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID. Please provide a numeric ID.")
+    return await _revoke(update, context)
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    @admin_only
+    async def _list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not AUTHORIZED_USERS:
+            await update.message.reply_text("No users are authorized yet.")
+            return
+        user_list = '\n'.join([f"• {user_id}" for user_id in AUTHORIZED_USERS])
+        await update.message.reply_text(f"🔐 *Authorized Users:*\n{user_list}")
+    return await _list_users(update, context)
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    await update.message.reply_text(
+        f"👤 *Your Information:*\n"
+        f"• User ID: `{user.id}`\n"
+        f"• Username: @{user.username if user.username else 'None'}\n"
+        f"• Auth Status: {'✅ Authorized' if user.id in AUTHORIZED_USERS else '❌ Not authorized'}"
+    )
+
+# Main function to run the bot in long-polling mode
+async def main():
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Add command and message handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("image", generate_image))
+    application.add_handler(CommandHandler("auth", auth))
+    application.add_handler(CommandHandler("revoke", revoke))
+    application.add_handler(CommandHandler("users", list_users))
+    application.add_handler(CommandHandler("whoami", whoami))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_message))
+    application.add_handler(MessageHandler(filters.VOICE, process_voice))
+
+    # Start the bot
+    await application.initialize()
+    await application.start()
+    print("✅ Bot is running!")
+    logger.info("Bot started successfully")
+
+    try:
+        await application.updater.start_polling(drop_pending_updates=True)
+        await asyncio.Event().wait()  # Run indefinitely
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot is shutting down...")
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+
+if __name__ == "__main__":
+    if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+        print("❌ Error: Missing required environment variables. Please set TELEGRAM_TOKEN and GEMINI_API_KEY.")
+        exit(1)
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.error(f"Critical error: {e}")
+        print(f"❌ Critical error: {e}")

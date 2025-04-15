@@ -1,5 +1,3 @@
-## 📘 **README.md**
-
 # 🤖 Gemini AI Telegram Bot
 
 A powerful, interactive Telegram bot that leverages Google's Gemini API to provide:
